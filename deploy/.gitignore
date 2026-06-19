@@ -1,0 +1,7 @@
+# Never commit real secrets or local backups.
+.env
+backups/
+
+# Python build artifacts (ai-service)
+__pycache__/
+*.pyc

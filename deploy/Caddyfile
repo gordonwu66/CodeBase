@@ -1,0 +1,37 @@
+# Caddy reverse proxy for CodeBase / Gitea.
+#
+# TLS strategy is controlled by the CADDY_TLS env var (see .env.example). It is passed
+# straight to Caddy's `tls` directive, so it must be one of:
+#   CADDY_TLS=you@example.com  -> public ACME (Let's Encrypt) using this account email.
+#                                 Requires a real domain + ports 80/443 reachable from the internet.
+#   CADDY_TLS=internal         -> Caddy's local CA. Use for prototype / *.localhost. Browsers warn
+#                                 unless the Caddy root CA is trusted (run `caddy trust` on the host,
+#                                 or import caddy-data/.../authorities/local/root.crt).
+#
+# The {$VAR} form is substituted from the environment at load time.
+
+{$GITEA_DOMAIN} {
+	encode zstd gzip
+
+	# Health endpoint, handy for external uptime checks.
+	handle /api/healthz {
+		reverse_proxy gitea:3000
+	}
+
+	handle {
+		reverse_proxy gitea:3000
+	}
+
+	tls {$CADDY_TLS}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

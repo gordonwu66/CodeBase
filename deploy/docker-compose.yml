@@ -1,0 +1,151 @@
+# CodeBase — Phase 1 forge foundation
+# Gitea (SQLite) behind a Caddy reverse proxy with automatic HTTPS.
+#
+# Usage:
+#   cp .env.example .env   # then edit values
+#   docker compose up -d
+#
+# Keep this as close to upstream Gitea as possible (see design-doc "Customization Strategy").
+# All Gitea config is expressed as GITEA__section__KEY env vars so app.ini stays
+# generated/upgrade-safe rather than hand-edited.
+
+services:
+  gitea:
+    image: gitea/gitea:1.22.6
+    container_name: codebase-gitea
+    restart: unless-stopped
+    environment:
+      # Run the container process as a fixed uid/gid so the data volume has stable ownership.
+      USER_UID: "1000"
+      USER_GID: "1000"
+
+      # --- Database: SQLite for prototype speed (see runbook "Postgres migration assumptions") ---
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__database__PATH: /data/gitea/gitea.db
+
+      # --- Server / URLs ---
+      # DOMAIN and ROOT_URL must match the public hostname Caddy terminates TLS for.
+      GITEA__server__DOMAIN: ${GITEA_DOMAIN}
+      GITEA__server__SSH_DOMAIN: ${GITEA_DOMAIN}
+      GITEA__server__ROOT_URL: https://${GITEA_DOMAIN}/
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__PROTOCOL: http            # TLS is terminated by Caddy, not Gitea
+      # SSH is handled by the image's built-in OpenSSH daemon (listens on container port 22).
+      # We only advertise the host-mapped port in clone URLs — do NOT also enable Gitea's
+      # internal SSH server, or it double-binds port 22 and crash-loops.
+      GITEA__server__SSH_PORT: "${GITEA_SSH_PORT}"  # advertised to clients (host-mapped)
+      GITEA__server__LFS_START_SERVER: "true"
+
+      # --- Security: locked-down prototype, single admin bootstrap ---
+      GITEA__security__INSTALL_LOCK: "true"     # skip the web installer; config comes from here
+      GITEA__security__SECRET_KEY: ${GITEA_SECRET_KEY}
+      GITEA__security__INTERNAL_TOKEN: ${GITEA_INTERNAL_TOKEN}
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__service__REQUIRE_SIGNIN_VIEW: "true"
+      GITEA__openid__ENABLE_OPENID_SIGNIN: "false"
+      GITEA__repository__DEFAULT_BRANCH: main
+
+      # --- Webhooks: allow the future AI companion service to receive events ---
+      # Comma-separated allowlist; '*' is convenient locally but tighten for production.
+      GITEA__webhook__ALLOWED_HOST_LIST: ${GITEA_WEBHOOK_ALLOWED_HOSTS}
+
+      # --- Actions: enabled now so Phase 2 (CI runner) needs no redeploy ---
+      GITEA__actions__ENABLED: "true"
+    volumes:
+      - gitea-data:/data
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      # SSH for git clone/push over ssh://git@host:PORT/...
+      - "${GITEA_SSH_PORT}:22"
+    networks:
+      - codebase
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:3000/api/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  caddy:
+    image: caddy:2.8
+    container_name: codebase-caddy
+    restart: unless-stopped
+    depends_on:
+      - gitea
+    environment:
+      GITEA_DOMAIN: ${GITEA_DOMAIN}
+      CADDY_TLS: ${CADDY_TLS}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data        # persisted certs/ACME state — back this up to avoid rate limits
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - codebase
+
+  # --- Phase 2: Gitea Actions CI runner ---
+  # Executes repository workflows. It registers to Gitea once (token from .env) and persists
+  # its identity in the runner-data volume so restarts don't re-register.
+  #
+  # SECURITY: this runner runs untrusted repository code and is given the host Docker socket
+  # so it can start job containers. That is effectively root on the host. Acceptable for a
+  # local single-tenant prototype; for anything shared, isolate it (dedicated host / rootless
+  # docker / DinD) — see runbook "Runner security & scaling".
+  runner:
+    image: gitea/act_runner:0.2.11
+    container_name: codebase-runner
+    restart: unless-stopped
+    depends_on:
+      gitea:
+        condition: service_healthy
+    environment:
+      GITEA_INSTANCE_URL: http://gitea:3000        # internal URL; job containers reach Gitea on this network
+      GITEA_RUNNER_REGISTRATION_TOKEN: ${RUNNER_REGISTRATION_TOKEN}
+      GITEA_RUNNER_NAME: codebase-runner-1
+      CONFIG_FILE: /config/config.yaml
+    volumes:
+      - runner-data:/data
+      - ./runner/config.yaml:/config/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock   # lets the runner spawn job containers
+    networks:
+      - codebase
+
+  # --- Phase 3: AI companion service (scaffold) ---
+  # Receives Gitea webhooks on /gitea/events and acts back via the Gitea API as a bot.
+  # It runs NO repository code and needs NO host socket — unlike the runner it is unprivileged.
+  # Not published to the host: Gitea reaches it at http://ai-service:8080 on the internal network.
+  # To expose it externally later, add a Caddy route; the Gitea->AI webhook URL is a placeholder
+  # for now (see AI_WEBHOOK_TARGET_URL in .env / scripts/register-webhook.sh).
+  ai-service:
+    build: ./ai-service
+    image: codebase/ai-service:0.1.0
+    container_name: codebase-ai
+    restart: unless-stopped
+    depends_on:
+      gitea:
+        condition: service_healthy
+    environment:
+      PORT: "8080"
+      GITEA_API_URL: http://gitea:3000/api/v1     # internal — no Caddy/TLS hop needed
+      GITEA_BOT_TOKEN: ${AI_BOT_TOKEN}            # scoped token for the codebase-ai-bot identity
+      WEBHOOK_SECRET: ${AI_WEBHOOK_SECRET}        # HMAC shared with the Gitea webhook
+      STATUS_CONTEXT: codebase-ai/review
+    networks:
+      - codebase
+
+networks:
+  codebase:
+    name: codebase
+
+volumes:
+  gitea-data:
+    name: codebase-gitea-data
+  caddy-data:
+    name: codebase-caddy-data
+  caddy-config:
+    name: codebase-caddy-config
+  runner-data:
+    name: codebase-runner-data

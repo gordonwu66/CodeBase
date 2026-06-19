@@ -1,0 +1,31 @@
+# act_runner configuration for the CodeBase CI runner.
+# Docs: https://gitea.com/gitea/act_runner
+
+log:
+  level: info
+
+runner:
+  # Concurrent jobs this runner will execute. Scale by raising this OR adding more runner
+  # containers (see runbook "Runner security & scaling").
+  capacity: 1
+  timeout: 1h
+  # Labels map a `runs-on:` value to the container image jobs run in.
+  # NOTE: unlike GitHub, "ubuntu-latest" is NOT the fat GitHub runner image — here it's a
+  # plain node image. Tools you assume on GitHub (docker, aws-cli, etc.) are NOT preinstalled.
+  # Use a heavier image (e.g. catthehacker/ubuntu) per-label if a workflow needs more.
+  labels:
+    - "ubuntu-latest:docker://node:20-bookworm"
+    - "ubuntu-22.04:docker://node:20-bookworm"
+
+container:
+  # Attach job containers to the compose network so actions/checkout can reach gitea:3000.
+  network: codebase
+  # Keep the runner constrained — no privileged job containers.
+  privileged: false
+  # Restrict bind-mounts jobs can request (empty = none beyond what the runner injects).
+  valid_volumes: []
+
+cache:
+  # Internal cache server for actions/cache. Enabled; if cross-network resolution proves
+  # flaky on Docker Desktop it can be disabled here (documented gap).
+  enabled: true
